@@ -86,16 +86,18 @@ void init()
     FILE *disk = fopen(diskfile, "r+b");
     fwrite(&superblock, sizeof(Superblock), 1, disk);
     
-    bool free_inode[superblock.inode_count] = {0}; //0 means free, 1 means occupied
+    bool *free_inode = (bool *)calloc(superblock.inode_count, sizeof(bool)); //0 means free, 1 means occupied
     free_inode[0] = 1;
     free_inode[1] = 1;
     free_inode[2] = 1;
-    fwrite(&free_inode, sizeof(free_inode), 1, disk);
+    fwrite(free_inode, sizeof(bool), superblock.inode_count, disk);
+    free(free_inode);
 
-    bool free_datablock[superblock.datablocks_count] = {0}; //0 means free, 1 means occupied 
+    bool *free_datablock = (bool *)calloc(superblock.datablocks_count, sizeof(bool)); //0 means free, 1 means occupied 
     free_datablock[0] = 1;
     free_datablock[1] = 1;
-    fwrite(&free_datablock, sizeof(free_datablock), 1, disk);
+    fwrite(free_datablock, sizeof(bool), superblock.datablocks_count, disk);
+    free(free_datablock);
 
     Inode root_dir;
     root_dir.id = 0;
@@ -107,48 +109,13 @@ void init()
     strcpy(root_dir.name, "/");
     for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
         root_dir.data_index[i] = -1;
-    root_dir.data_index[0] = 1; 
+     
     fwrite(&root_dir, sizeof(Inode), 1, disk);
-
-    Inode new_dir;
-    new_dir.id = 1;
-    new_dir.mode = S_IFDIR | 0755;
-    new_dir.size = DATA_BS;
-    new_dir.atime = time(NULL);
-    new_dir.mtime = time(NULL);
-    new_dir.type = 1;
-    strcpy(new_dir.name, "dir1");
-    for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
-        new_dir.data_index[i] = -1;
-    new_dir.data_index[0] = 2;
-    fwrite(&new_dir, sizeof(Inode), 1, disk);
-
-    Inode file1;
-    file1.id = 2;
-    file1.mode = S_IFREG | 0644;
-    file1.size = 5000;
-    file1.atime = time(NULL);
-    file1.mtime = time(NULL);
-    file1.type = 0;
-    strcpy(file1.name, "file1");
-    for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
-        file1.data_index[i] = -1;
-    file1.data_index[0] = 0;
-
-    fwrite(&file1, sizeof(Inode), 1, disk);
-
-    fclose(disk);
-
-    char buff[DATA_BS];
-    for (int i=0; i<DATA_BS; i++)
-        buff[i] = 'a';
-    diskWrite(buff, DATA_BS, 1, sizeof(Superblock) + superblock.datablocks_count*sizeof(bool) + superblock.inode_count*sizeof(Inode) );
-    diskWrite(buff, DATA_BS, 1, sizeof(Superblock) + superblock.datablocks_count*sizeof(bool) + superblock.inode_count*sizeof(Inode) + DATA_BS);
     
-
     cout << "Successfull\n" << "Inode count: " << superblock.inode_count << endl;
     cout << "Datablock count: " << superblock.datablocks_count << endl;
     cout << "Total size: " << totalsize << endl;
+    fclose(disk);
 }
 
 int main(int argc, char **argv)

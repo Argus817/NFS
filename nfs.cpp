@@ -48,6 +48,21 @@ Superblock superblock;
 
 void diskRead(void *buff, size_t size, size_t count, long offset);
 void diskWrite(void *buff, size_t size, size_t count, long offset);
+Inode getInode(size_t index);
+Inode getInodeByPath(const char *path);
+int readDatablock(char *buff, size_t index);
+static int nfs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi);
+static int nfs_getattr(const char *path, struct stat *st);
+static int nfs_open(const char *path, struct fuse_file_info *fi);
+static int nfs_read(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *fi);
+static int nfs_rename(const char *old_path, const char *new_path);
+static int nfs_mkdir(const char *path, mode_t mode);
+static int nfs_mknod(const char *path, mode_t mode, dev_t rdev);
+static int nfs_write(const char *path, const char *buffer, size_t size, off_t offset, struct fuse_file_info *fi);
+static int nfs_truncate(const char *path, off_t size);
+static int nfs_utimens(const char *path, const struct timespec tv[2]);
+static int nfs_rmdir(const char *path);
+static int nfs_unlink(const char *path);
 
 void diskRead(void *buff, size_t size, size_t count, long offset)
 {
@@ -170,6 +185,19 @@ static int nfs_getattr(const char *path, struct stat *st)
     return 0;
 }
 
+static int nfs_open(const char *path, struct fuse_file_info *fi)
+{
+    Inode file = getInodeByPath(path);
+    
+    if (file.id == (size_t)(-1))
+        return -ENOENT;
+
+    if ((fi->flags & O_WRONLY) && (file.type == 1))
+        return -EISDIR; 
+
+    return 0; 
+}
+
 static int nfs_read(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *fi)
 {
     Inode file = getInodeByPath(path);
@@ -205,6 +233,95 @@ static int nfs_read(const char *path, char *buffer, size_t size, off_t offset, s
     return bytes_read;
 }
 
+static int nfs_rename(const char *old_path, const char *new_path)
+{
+    cout << old_path << " " << new_path << endl;
+    Inode old_file = getInodeByPath(old_path);
+    
+    if (old_file.id == (size_t)(-1))
+        return -ENOENT;
+
+    string parent_path = old_path; 
+    size_t last_slash = parent_path.find_last_of('/');
+    if (last_slash == string::npos || last_slash == 0)
+        parent_path = "/";
+    else
+        parent_path = parent_path.substr(0, last_slash); 
+
+    Inode old_parent = getInodeByPath(parent_path.c_str());
+    
+    if (old_parent.id == (size_t)(-1))
+        return -ENOENT;
+    if (old_parent.type == 0)
+        return -ENOTDIR; 
+
+    if (getInodeByPath(new_path).id != (size_t)(-1))
+    {
+        int stat = nfs_unlink(new_path);
+        if (stat != 0)
+            return stat;
+    }
+
+    parent_path = new_path; 
+    last_slash = parent_path.find_last_of('/');  
+    if (last_slash == string::npos || last_slash == 0)
+        parent_path = "/";
+    else
+        parent_path = parent_path.substr(0, last_slash); 
+    
+    Inode new_parent = getInodeByPath(parent_path.c_str());
+
+    if (new_parent.id == (size_t)(-1))
+        return -ENOENT;
+    if (new_parent.type == 0)
+        return -ENOTDIR;
+
+    
+    string name = "";
+    int i=0;
+    while (1)
+    {
+        if (new_path[i] == '\0')
+            break;
+        else if (new_path[i] == '/')
+            name = "";
+        else
+            name += new_path[i];
+        i++;
+    }
+    strcpy(old_file.name, name.c_str());
+    diskWrite(&old_file, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count+superblock.datablocks_count)*sizeof(bool) + old_file.id*sizeof(Inode));
+
+    if (new_parent.id == old_parent.id)
+    {
+           
+        return 0;
+    }
+
+    for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
+    {
+        if (new_parent.data_index[i] == -1)
+        {
+            new_parent.data_index[i] = old_file.id;
+            break;
+        }
+        if (i==INODE_DATABLOCK_COUNT-1 && new_parent.data_index[i]!=-1)
+            return -ENOSPC;
+    }
+    for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
+    {
+        if (old_parent.data_index[i] == old_file.id)
+        {
+            memmove(old_parent.data_index+i, old_parent.data_index+i+1, (INODE_DATABLOCK_COUNT-i-1)*sizeof(ll));
+            old_parent.data_index[INODE_DATABLOCK_COUNT-1] = -1;
+            break;
+        }
+    }
+    diskWrite(&new_parent, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count+superblock.datablocks_count)*sizeof(bool) + new_parent.id*sizeof(Inode));
+    diskWrite(&old_parent, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count+superblock.datablocks_count)*sizeof(bool) + old_parent.id*sizeof(Inode));
+    return 0;
+}
+
 static int nfs_mkdir(const char *path, mode_t mode)
 {
     if (getInodeByPath(path).id != (size_t)(-1))
@@ -225,8 +342,8 @@ static int nfs_mkdir(const char *path, mode_t mode)
     if (parent.type == 0)
         return -ENOTDIR;
 
-    bool free_inode[superblock.inode_count] = {0};
-    diskRead(&free_inode, sizeof(free_inode), 1, sizeof(Superblock));
+    bool *free_inode = (bool *)calloc(superblock.inode_count, sizeof(bool));
+    diskRead(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock));
     size_t free_id = (size_t)(-1);
     for (size_t i=0; i<superblock.inode_count; i++)
     {
@@ -237,8 +354,10 @@ static int nfs_mkdir(const char *path, mode_t mode)
         }
     } 
 
-    if (free_id == (size_t)(-1))
+    if (free_id == (size_t)(-1)) {
+        free(free_inode);        
         return -ENOSPC; 
+    }
 
     for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
     {
@@ -260,15 +379,304 @@ static int nfs_mkdir(const char *path, mode_t mode)
 
             diskWrite(&parent, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + parent.id*sizeof(Inode));
             free_inode[free_id] = 1;
-            diskWrite(&free_inode, sizeof(free_inode), 1, sizeof(Superblock)); 
-            
+            diskWrite(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock)); 
+            free(free_inode);
             diskWrite(&newdir, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + newdir.id*sizeof(Inode));
 
             return 0;
         }
     } 
-
+    free(free_inode);
     return -ENOSPC;
+}
+
+static int nfs_mknod(const char *path, mode_t mode, dev_t rdev)
+{
+    if (getInodeByPath(path).id != (size_t)(-1))
+        return -EEXIST;
+
+    string parent_path = path; 
+    size_t last_slash = parent_path.find_last_of('/');
+    if (last_slash == string::npos || last_slash == 0)
+        parent_path = "/";
+    else
+        parent_path = parent_path.substr(0, last_slash); 
+
+    Inode parent = getInodeByPath(parent_path.c_str());
+
+    if (parent.id == (size_t)(-1))
+        return -ENOENT;
+
+    if (parent.type == 0)
+        return -ENOTDIR;
+
+    bool *free_inode = (bool *)calloc(superblock.inode_count, sizeof(bool));
+    diskRead(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock));
+    size_t free_id = (size_t)(-1);
+    for (size_t i=0; i<superblock.inode_count; i++)
+    {
+        if (free_inode[i] == 0)
+        {
+            free_id = (size_t)i;
+            break;
+        }
+    } 
+
+    if (free_id == (size_t)(-1)) {
+        free(free_inode);    
+        return -ENOSPC;
+    }
+
+    for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
+    {
+        if (parent.data_index[i] == -1)
+        {
+            Inode newfile;
+            newfile.id = free_id;
+            newfile.mode = mode | S_IFREG;
+            newfile.size = 0;
+            newfile.atime = time(NULL);
+            newfile.mtime = time(NULL);
+            newfile.type = 0;
+            strncpy(newfile.name, path + last_slash + 1, sizeof(newfile.name) - 1);
+            for (int i = 0; i < INODE_DATABLOCK_COUNT; i++)
+                newfile.data_index[i] = -1;
+
+            parent.data_index[i] = newfile.id;
+            parent.mtime = time(NULL);
+
+            diskWrite(&parent, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + parent.id*sizeof(Inode));
+            free_inode[free_id] = 1;
+            diskWrite(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock)); 
+            free(free_inode);
+            diskWrite(&newfile, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + newfile.id*sizeof(Inode));
+
+            return 0;
+        }
+    } 
+    free(free_inode);
+    return -ENOSPC;
+}
+
+static int nfs_write(const char *path, const char *buffer, size_t size, off_t offset, struct fuse_file_info *fi)
+{
+    Inode file = getInodeByPath(path);
+    if (file.id == (size_t)(-1))
+        return -ENOENT;
+
+    if (file.type == 1)
+        return -EISDIR;
+
+    size_t start_block = offset / DATA_BS;
+    size_t block_offset = offset % DATA_BS;
+    size_t bytes_written = 0;
+
+    bool *free_blocks = (bool *)calloc(superblock.datablocks_count, sizeof(bool));
+    diskRead(free_blocks, sizeof(bool), superblock.datablocks_count, sizeof(Superblock) + superblock.inode_count * sizeof(bool));
+
+    while (bytes_written < size)
+    {
+        if (file.data_index[start_block] == -1)
+        {
+            size_t free_block = (size_t)(-1);
+            for (size_t i = 0; i < superblock.datablocks_count; i++)
+            {
+                if (!free_blocks[i])
+                {
+                    free_block = i;
+                    free_blocks[i] = 1;
+                    break;
+                }
+            }
+
+            if (free_block == (size_t)(-1)) {
+                free(free_blocks);            
+                return -ENOSPC;
+            }
+
+            file.data_index[start_block] = free_block;
+        }
+
+        size_t chunk_size = min(DATA_BS - block_offset, size - bytes_written);
+
+        char temp[DATA_BS] = {0};
+        if (block_offset > 0 || chunk_size < DATA_BS)
+            diskRead(temp, DATA_BS, 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + superblock.inode_count * sizeof(Inode) + file.data_index[start_block] * DATA_BS);
+
+        memmove(temp + block_offset, buffer + bytes_written, chunk_size);
+        diskWrite(temp, DATA_BS, 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + superblock.inode_count * sizeof(Inode) + file.data_index[start_block] * DATA_BS);
+
+        bytes_written += chunk_size;
+        block_offset = 0;
+        start_block++;
+    }
+
+    file.size = max(file.size, offset + bytes_written);
+    file.mtime = time(NULL);
+    diskWrite(&file, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + file.id * sizeof(Inode));
+
+    diskWrite(free_blocks, sizeof(bool), superblock.datablocks_count, sizeof(Superblock) + superblock.inode_count * sizeof(bool));
+    free(free_blocks);
+    return bytes_written;
+}
+
+static int nfs_truncate(const char *path, off_t size)
+{
+    Inode file = getInodeByPath(path);
+    if (file.id == (size_t)(-1))
+        return -ENOENT; 
+
+    if (file.type == 1)  
+        return -EISDIR;  
+
+    //printf("Truncating file %s to size %lld\n", path, (long long)size);
+
+    if (size == 0) 
+    {
+        bool *free_datablock = (bool *)calloc(superblock.datablocks_count, sizeof(bool));
+        diskRead(free_datablock, sizeof(bool), superblock.datablocks_count, sizeof(Superblock)+superblock.inode_count*sizeof(bool));
+        for (size_t i = 0; i < (file.size + DATA_BS - 1) / DATA_BS; i++)
+        {
+            if (file.data_index[i] != (size_t)-1)
+            {
+                free_datablock[file.data_index[i]] = 0;   
+                memmove(file.data_index+i, file.data_index+i+1, (INODE_DATABLOCK_COUNT-i-1)*sizeof(ll));
+                file.data_index[INODE_DATABLOCK_COUNT-1] = -1;
+            }
+        }
+        diskWrite(free_datablock, sizeof(bool), superblock.datablocks_count, sizeof(Superblock)+superblock.inode_count*sizeof(bool));
+        free(free_datablock);
+    }
+
+    file.size = size;
+    file.mtime = time(NULL);
+
+    
+    diskWrite(&file, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + file.id * sizeof(Inode));
+
+    //printf("Truncate complete: %s, new size: %zu\n", path, file.size);
+
+    return 0;
+}
+
+
+static int nfs_utimens(const char *path, const struct timespec tv[2]) 
+{
+    Inode file = getInodeByPath(path);
+    if (file.id == (size_t)(-1))
+        return -ENOENT;
+
+    file.atime = tv[0].tv_sec;
+    file.mtime = tv[1].tv_sec;
+ 
+    diskWrite(&file, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + file.id * sizeof(Inode));
+
+    return 0;
+}
+
+static int nfs_rmdir(const char *path)
+{
+    string parent_path = path; 
+    size_t last_slash = parent_path.find_last_of('/');
+    if (last_slash == string::npos || last_slash == 0)
+        parent_path = "/";
+    else
+        parent_path = parent_path.substr(0, last_slash); 
+
+    Inode parent = getInodeByPath(parent_path.c_str());
+
+    if (parent.id == (size_t)(-1))
+        return -ENOENT;
+
+    if (parent.type == 0)
+        return -ENOTDIR;
+
+    Inode dir = getInodeByPath(path);
+    if (dir.id == (size_t)(-1))
+        return -ENOENT;
+
+    if (dir.type == 0)
+        return -ENOTDIR;
+
+    if (dir.data_index[0] != -1)
+        return -ENOTEMPTY;
+
+    bool *free_inode = (bool *)calloc(superblock.inode_count, sizeof(bool));
+    diskRead(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock));
+
+    free_inode[dir.id] = 0;
+    diskWrite(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock));
+    free(free_inode);
+
+    for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
+    {
+        if (parent.data_index[i] == dir.id)
+        {
+            memmove(parent.data_index+i, parent.data_index+i+1, (INODE_DATABLOCK_COUNT-i-1)*sizeof(ll));
+            parent.data_index[INODE_DATABLOCK_COUNT-1] = -1;
+            break;
+        }
+    }
+    diskWrite(&parent, sizeof(parent), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count)*sizeof(bool) + parent.id*sizeof(Inode));
+    return 0;
+}
+
+static int nfs_unlink(const char *path)
+{
+    string parent_path = path; 
+    size_t last_slash = parent_path.find_last_of('/');
+    if (last_slash == string::npos || last_slash == 0)
+        parent_path = "/";
+    else
+        parent_path = parent_path.substr(0, last_slash); 
+
+    Inode parent = getInodeByPath(parent_path.c_str());
+
+    if (parent.id == (size_t)(-1))
+        return -ENOENT;
+
+    if (parent.type == 0)
+        return -ENOTDIR;
+
+    Inode file = getInodeByPath(path);
+
+    if (file.id == (size_t)(-1))
+        return -ENOENT;
+
+    if (file.type == 1)
+        return -EISDIR;
+
+    bool *free_inode = (bool *)calloc(superblock.inode_count, sizeof(bool));
+    diskRead(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock));
+    bool *free_datablock = (bool *)calloc(superblock.datablocks_count, sizeof(bool));
+    diskRead(free_datablock, sizeof(bool), superblock.datablocks_count, sizeof(Superblock)+superblock.inode_count*sizeof(bool));
+
+    for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
+    {
+        if (parent.data_index[i] == file.id)
+        {
+            memmove(parent.data_index+i, parent.data_index+i+1, (INODE_DATABLOCK_COUNT-i-1)*sizeof(ll));
+            parent.data_index[INODE_DATABLOCK_COUNT-1] = -1;
+            break;
+        }
+    }
+
+    for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
+    {
+        if (file.data_index[i] == -1)
+            break;
+        free_datablock[file.data_index[i]] = 0;
+    }
+
+    free_inode[file.id] = 0;
+    diskWrite(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock));
+    diskWrite(free_datablock, sizeof(bool), superblock.datablocks_count, sizeof(Superblock)+superblock.inode_count*sizeof(bool));
+    diskWrite(&parent, sizeof(parent), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count)*sizeof(bool) + parent.id*sizeof(Inode));
+
+    free(free_inode);
+    free(free_datablock);    
+
+    return 0;
 }
 
 void init()
@@ -288,9 +696,15 @@ int main(int argc, char *argv[])
     static struct fuse_operations operations = {};
     operations.getattr = nfs_getattr;
     operations.readdir = nfs_readdir;
-    operations.read = nfs_read;
+    operations.read = nfs_read; 
+    operations.rename = nfs_rename;
     operations.mkdir = nfs_mkdir;
+    operations.mknod = nfs_mknod;
+    operations.write = nfs_write;
+    operations.open = nfs_open;
+    operations.truncate = nfs_truncate;
+    operations.rmdir = nfs_rmdir;
+    operations.unlink = nfs_unlink;
+    operations.utimens = nfs_utimens;
     return fuse_main( argc, argv, &operations, NULL );
-    cout << getInodeByPath("/dir1/abc").name << endl;
-    return 0;
 }
