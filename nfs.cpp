@@ -15,6 +15,7 @@ using namespace std;
 struct Superblock 
 {
     char sig[4];
+    size_t totalsize;
     size_t inode_count;
     size_t datablocks_count;
 };
@@ -167,6 +168,7 @@ static int nfs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, o
 
         filler(buffer, getInode(dir.data_index[i]).name, NULL, 0);
     }
+    cout << "Readdir. Path: " << path << endl;
     return 0;
 }
 
@@ -182,6 +184,7 @@ static int nfs_getattr(const char *path, struct stat *st)
     st->st_mtime = entry.mtime;
     st->st_mode = entry.mode;
     st->st_size = entry.size; 
+    cout << "GetAttr. Path: " << path << endl;
     return 0;
 }
 
@@ -195,6 +198,7 @@ static int nfs_open(const char *path, struct fuse_file_info *fi)
     if ((fi->flags & O_WRONLY) && (file.type == 1))
         return -EISDIR; 
 
+    cout << "Open. Path: " << path << endl;
     return 0; 
 }
 
@@ -230,6 +234,7 @@ static int nfs_read(const char *path, char *buffer, size_t size, off_t offset, s
         ind++;  
     }
 
+    cout << "Read. Path: " << path << " Size: " << size << " Offset: " << offset << endl;
     return bytes_read;
 }
 
@@ -275,8 +280,7 @@ static int nfs_rename(const char *old_path, const char *new_path)
         return -ENOENT;
     if (new_parent.type == 0)
         return -ENOTDIR;
-
-    
+ 
     string name = "";
     int i=0;
     while (1)
@@ -294,7 +298,7 @@ static int nfs_rename(const char *old_path, const char *new_path)
 
     if (new_parent.id == old_parent.id)
     {
-           
+        cout << "Rename. OldPath: " << old_path << " NewPath: " << new_path << endl;
         return 0;
     }
 
@@ -319,6 +323,8 @@ static int nfs_rename(const char *old_path, const char *new_path)
     }
     diskWrite(&new_parent, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count+superblock.datablocks_count)*sizeof(bool) + new_parent.id*sizeof(Inode));
     diskWrite(&old_parent, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count+superblock.datablocks_count)*sizeof(bool) + old_parent.id*sizeof(Inode));
+
+    cout << "Rename. OldPath: " << old_path << " NewPath: " << new_path << endl;
     return 0;
 }
 
@@ -383,9 +389,11 @@ static int nfs_mkdir(const char *path, mode_t mode)
             free(free_inode);
             diskWrite(&newdir, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + newdir.id*sizeof(Inode));
 
+            cout << "Mkdir. Path: " << path << endl;
             return 0;
         }
     } 
+
     free(free_inode);
     return -ENOSPC;
 }
@@ -451,9 +459,11 @@ static int nfs_mknod(const char *path, mode_t mode, dev_t rdev)
             free(free_inode);
             diskWrite(&newfile, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + newfile.id*sizeof(Inode));
 
+            cout << "Mknod. Path: " << path << endl;
             return 0;
         }
     } 
+
     free(free_inode);
     return -ENOSPC;
 }
@@ -517,6 +527,8 @@ static int nfs_write(const char *path, const char *buffer, size_t size, off_t of
 
     diskWrite(free_blocks, sizeof(bool), superblock.datablocks_count, sizeof(Superblock) + superblock.inode_count * sizeof(bool));
     free(free_blocks);
+
+    cout << "Write: Path: " << path << " Size: " << size << " Offset: " << offset << endl;
     return bytes_written;
 }
 
@@ -528,8 +540,6 @@ static int nfs_truncate(const char *path, off_t size)
 
     if (file.type == 1)  
         return -EISDIR;  
-
-    //printf("Truncating file %s to size %lld\n", path, (long long)size);
 
     if (size == 0) 
     {
@@ -554,8 +564,7 @@ static int nfs_truncate(const char *path, off_t size)
     
     diskWrite(&file, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + file.id * sizeof(Inode));
 
-    //printf("Truncate complete: %s, new size: %zu\n", path, file.size);
-
+    cout << "Truncate: Path: " << path << " Size: " << size << endl;
     return 0;
 }
 
@@ -571,6 +580,7 @@ static int nfs_utimens(const char *path, const struct timespec tv[2])
  
     diskWrite(&file, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + file.id * sizeof(Inode));
 
+    cout << "Utimens. Path: " << path << endl;
     return 0;
 }
 
@@ -618,6 +628,8 @@ static int nfs_rmdir(const char *path)
         }
     }
     diskWrite(&parent, sizeof(parent), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count)*sizeof(bool) + parent.id*sizeof(Inode));
+
+    cout << "Rmdir. Path: " << path << endl;
     return 0;
 }
 
@@ -676,6 +688,7 @@ static int nfs_unlink(const char *path)
     free(free_inode);
     free(free_datablock);    
 
+    cout << "Unlink. Path: " << path << endl;
     return 0;
 }
 

@@ -15,6 +15,7 @@ using namespace std;
 struct Superblock 
 {
     char sig[4];
+    size_t totalsize;
     size_t inode_count;
     size_t datablocks_count;
 };
@@ -76,6 +77,7 @@ void init()
 {
     strcpy(superblock.sig, "3NFS");
     size_t totalsize = filesystem::file_size(diskfile);
+    superblock.totalsize = totalsize;
     if (filesystem::file_size(diskfile) <= DATA_BS+INODE_BS+sizeof(Superblock))
     {
         cerr << "Size of image.iso is very small\n";
@@ -89,13 +91,11 @@ void init()
     bool *free_inode = (bool *)calloc(superblock.inode_count, sizeof(bool)); //0 means free, 1 means occupied
     free_inode[0] = 1;
     free_inode[1] = 1;
-    free_inode[2] = 1;
     fwrite(free_inode, sizeof(bool), superblock.inode_count, disk);
     free(free_inode);
 
     bool *free_datablock = (bool *)calloc(superblock.datablocks_count, sizeof(bool)); //0 means free, 1 means occupied 
     free_datablock[0] = 1;
-    free_datablock[1] = 1;
     fwrite(free_datablock, sizeof(bool), superblock.datablocks_count, disk);
     free(free_datablock);
 
@@ -109,13 +109,31 @@ void init()
     strcpy(root_dir.name, "/");
     for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
         root_dir.data_index[i] = -1;
-     
+    root_dir.data_index[0] = 1;
+
     fwrite(&root_dir, sizeof(Inode), 1, disk);
+
+    Inode info_file;
+    info_file.id = 1;
+    info_file.mode = S_IFREG | 0644;
+    info_file.size = 60;
+    info_file.atime = time(NULL);
+    info_file.mtime = time(NULL);
+    info_file.type = 0;
+    strcpy(info_file.name, "INFO");
+    for (int i=0; i<INODE_DATABLOCK_COUNT; i++)
+        info_file.data_index[i] = -1;
+    info_file.data_index[0] = 0;
+
+    fwrite(&info_file, sizeof(Inode), 1, disk);
+    fclose(disk);
+
+    char buffer[60] = "NFS: FileSystem created by Naman Tandel\nStudent of IIT(BHU)";
+    diskWrite(buffer, sizeof(char), 60, sizeof(Superblock) + (superblock.inode_count+superblock.datablocks_count)*sizeof(bool) + superblock.inode_count*sizeof(Inode));
     
     cout << "Successfull\n" << "Inode count: " << superblock.inode_count << endl;
     cout << "Datablock count: " << superblock.datablocks_count << endl;
     cout << "Total size: " << totalsize << endl;
-    fclose(disk);
 }
 
 int main(int argc, char **argv)
