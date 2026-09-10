@@ -2,8 +2,19 @@
 
 #include <fuse.h>
 #include <filesystem>
-#include <bits/stdc++.h>
+#include <iostream>
+#include <fstream>
+#include <cstring>
+#include <cstdlib>
 #include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <algorithm>
+#include <string>
+#include <mutex>
+#include <vector>
 using namespace std;
 
 #define ll long long int
@@ -46,6 +57,9 @@ struct Inode
 
 const char diskfile[] = "image.iso";
 Superblock superblock;
+vector <unique_ptr<mutex>> datablock_mutex, inode_mutex;
+mutex inode_bitmap_mutex, datablock_bitmap_mutex;
+recursive_mutex operation_mutex;
 
 void diskRead(void *buff, size_t size, size_t count, long offset);
 void diskWrite(void *buff, size_t size, size_t count, long offset);
@@ -54,7 +68,9 @@ Inode getInodeByPath(const char *path);
 int readDatablock(char *buff, size_t index);
 static int nfs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi);
 static int nfs_getattr(const char *path, struct stat *st);
+static int nfs_statfs(const char *path, struct statvfs *st);
 static int nfs_open(const char *path, struct fuse_file_info *fi);
+static int nfs_create(const char *path, mode_t mode, struct fuse_file_info *fi);
 static int nfs_read(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *fi);
 static int nfs_rename(const char *old_path, const char *new_path);
 static int nfs_mkdir(const char *path, mode_t mode);
@@ -93,6 +109,7 @@ void diskWrite(void *buff, size_t size, size_t count, long offset)
 
 Inode getInode(size_t index)
 {
+    unique_lock lock(*inode_mutex[index]);
     long offset = sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count)*sizeof(bool) + index*sizeof(Inode);
     Inode target;
     diskRead(&target, sizeof(Inode), 1, offset);
@@ -151,6 +168,7 @@ Inode getInodeByPath(const char *path)
 
 int readDatablock(char *buff, size_t index)
 {
+    unique_lock lock(*datablock_mutex[index]);
     size_t offset = sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count)*sizeof(bool) + superblock.inode_count*sizeof(Inode) + index*DATA_BS;
     diskRead(buff, DATA_BS, 1, offset);
     return DATA_BS;
@@ -158,6 +176,7 @@ int readDatablock(char *buff, size_t index)
 
 static int nfs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, off_t offset, struct fuse_file_info *fi)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     filler(buffer, ".", NULL, 0);
     filler(buffer, "..", NULL, 0);
     Inode dir = getInodeByPath(path);
@@ -174,6 +193,7 @@ static int nfs_readdir(const char *path, void *buffer, fuse_fill_dir_t filler, o
 
 static int nfs_getattr(const char *path, struct stat *st)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     Inode entry = getInodeByPath(path);
 
     if (entry.id == (size_t)(-1))
@@ -188,8 +208,50 @@ static int nfs_getattr(const char *path, struct stat *st)
     return 0;
 }
 
+static int nfs_statfs(const char *path, struct statvfs *st)
+{
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
+    unique_lock inode_bitmap_lock(inode_bitmap_mutex), datablock_bitmap_lock(datablock_bitmap_mutex);
+
+    bool *free_inodes = (bool *)calloc(superblock.inode_count, sizeof(bool));
+    bool *free_datablocks = (bool *)calloc(superblock.datablocks_count, sizeof(bool));
+    if (!free_inodes || !free_datablocks)
+    {
+        free(free_inodes);
+        free(free_datablocks);
+        return -ENOMEM;
+    }
+
+    diskRead(free_inodes, sizeof(bool), superblock.inode_count, sizeof(Superblock));
+    diskRead(free_datablocks, sizeof(bool), superblock.datablocks_count,
+             sizeof(Superblock) + superblock.inode_count * sizeof(bool));
+
+    size_t free_inode_count = 0;
+    size_t free_datablock_count = 0;
+    for (size_t i = 0; i < superblock.inode_count; i++)
+        free_inode_count += !free_inodes[i];
+    for (size_t i = 0; i < superblock.datablocks_count; i++)
+        free_datablock_count += !free_datablocks[i];
+
+    memset(st, 0, sizeof(*st));
+    st->f_bsize = DATA_BS;
+    st->f_frsize = DATA_BS;
+    st->f_blocks = superblock.datablocks_count;
+    st->f_bfree = free_datablock_count;
+    st->f_bavail = free_datablock_count;
+    st->f_files = superblock.inode_count;
+    st->f_ffree = free_inode_count;
+    st->f_favail = free_inode_count;
+    st->f_namemax = sizeof(((Inode *)0)->name) - 1;
+
+    free(free_inodes);
+    free(free_datablocks);
+    return 0;
+}
+
 static int nfs_open(const char *path, struct fuse_file_info *fi)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     Inode file = getInodeByPath(path);
     
     if (file.id == (size_t)(-1))
@@ -202,8 +264,18 @@ static int nfs_open(const char *path, struct fuse_file_info *fi)
     return 0; 
 }
 
+static int nfs_create(const char *path, mode_t mode, struct fuse_file_info *fi)
+{
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
+    int result = nfs_mknod(path, mode, 0);
+    if (result != 0)
+        return result;
+    return nfs_open(path, fi);
+}
+
 static int nfs_read(const char *path, char *buffer, size_t size, off_t offset, struct fuse_file_info *fi)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     Inode file = getInodeByPath(path);
     if (file.id == (size_t)(-1))
         return -ENOENT;
@@ -223,6 +295,11 @@ static int nfs_read(const char *path, char *buffer, size_t size, off_t offset, s
 
     while (bytes_read < to_read)
     {
+        if (ind >= INODE_DATABLOCK_COUNT ||
+            file.data_index[ind] == -1 ||
+            static_cast<size_t>(file.data_index[ind]) >= superblock.datablocks_count)
+            return -EIO;
+
         if (readDatablock(temp, file.data_index[ind]) < 0)  
             return -EIO;  
 
@@ -240,6 +317,7 @@ static int nfs_read(const char *path, char *buffer, size_t size, off_t offset, s
 
 static int nfs_rename(const char *old_path, const char *new_path)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     cout << old_path << " " << new_path << endl;
     Inode old_file = getInodeByPath(old_path);
     
@@ -294,7 +372,9 @@ static int nfs_rename(const char *old_path, const char *new_path)
         i++;
     }
     strcpy(old_file.name, name.c_str());
+    unique_lock oldfile_lock(*inode_mutex[old_file.id]);
     diskWrite(&old_file, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count+superblock.datablocks_count)*sizeof(bool) + old_file.id*sizeof(Inode));
+    oldfile_lock.unlock();
 
     if (new_parent.id == old_parent.id)
     {
@@ -321,6 +401,7 @@ static int nfs_rename(const char *old_path, const char *new_path)
             break;
         }
     }
+    unique_lock newparent_lock(*inode_mutex[new_parent.id]), oldparent_lock(*inode_mutex[old_parent.id]);
     diskWrite(&new_parent, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count+superblock.datablocks_count)*sizeof(bool) + new_parent.id*sizeof(Inode));
     diskWrite(&old_parent, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count+superblock.datablocks_count)*sizeof(bool) + old_parent.id*sizeof(Inode));
 
@@ -330,6 +411,7 @@ static int nfs_rename(const char *old_path, const char *new_path)
 
 static int nfs_mkdir(const char *path, mode_t mode)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     if (getInodeByPath(path).id != (size_t)(-1))
         return -EEXIST;
 
@@ -349,6 +431,7 @@ static int nfs_mkdir(const char *path, mode_t mode)
         return -ENOTDIR;
 
     bool *free_inode = (bool *)calloc(superblock.inode_count, sizeof(bool));
+    unique_lock inode_bitmap_lock(inode_bitmap_mutex);
     diskRead(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock));
     size_t free_id = (size_t)(-1);
     for (size_t i=0; i<superblock.inode_count; i++)
@@ -383,6 +466,7 @@ static int nfs_mkdir(const char *path, mode_t mode)
             parent.data_index[i] = newdir.id;
             parent.mtime = time(NULL);
 
+            unique_lock parentdir_lock(*inode_mutex[parent.id]), newdir_lock(*inode_mutex[newdir.id]);
             diskWrite(&parent, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + parent.id*sizeof(Inode));
             free_inode[free_id] = 1;
             diskWrite(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock)); 
@@ -400,6 +484,7 @@ static int nfs_mkdir(const char *path, mode_t mode)
 
 static int nfs_mknod(const char *path, mode_t mode, dev_t rdev)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     if (getInodeByPath(path).id != (size_t)(-1))
         return -EEXIST;
 
@@ -419,6 +504,7 @@ static int nfs_mknod(const char *path, mode_t mode, dev_t rdev)
         return -ENOTDIR;
 
     bool *free_inode = (bool *)calloc(superblock.inode_count, sizeof(bool));
+    unique_lock inode_bitmap_lock(inode_bitmap_mutex);
     diskRead(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock));
     size_t free_id = (size_t)(-1);
     for (size_t i=0; i<superblock.inode_count; i++)
@@ -453,6 +539,7 @@ static int nfs_mknod(const char *path, mode_t mode, dev_t rdev)
             parent.data_index[i] = newfile.id;
             parent.mtime = time(NULL);
 
+            unique_lock parentdir_lock(*inode_mutex[parent.id]), newfile_lock(*inode_mutex[newfile.id]);
             diskWrite(&parent, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + parent.id*sizeof(Inode));
             free_inode[free_id] = 1;
             diskWrite(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock)); 
@@ -470,6 +557,7 @@ static int nfs_mknod(const char *path, mode_t mode, dev_t rdev)
 
 static int nfs_write(const char *path, const char *buffer, size_t size, off_t offset, struct fuse_file_info *fi)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     Inode file = getInodeByPath(path);
     if (file.id == (size_t)(-1))
         return -ENOENT;
@@ -481,7 +569,12 @@ static int nfs_write(const char *path, const char *buffer, size_t size, off_t of
     size_t block_offset = offset % DATA_BS;
     size_t bytes_written = 0;
 
+    if (start_block >= INODE_DATABLOCK_COUNT ||
+        size > (INODE_DATABLOCK_COUNT - start_block) * DATA_BS - block_offset)
+        return -ENOSPC;
+
     bool *free_blocks = (bool *)calloc(superblock.datablocks_count, sizeof(bool));
+    unique_lock datablock_bitmap_lock(datablock_bitmap_mutex), file_inode_lock(*inode_mutex[file.id]);
     diskRead(free_blocks, sizeof(bool), superblock.datablocks_count, sizeof(Superblock) + superblock.inode_count * sizeof(bool));
 
     while (bytes_written < size)
@@ -506,6 +599,7 @@ static int nfs_write(const char *path, const char *buffer, size_t size, off_t of
 
             file.data_index[start_block] = free_block;
         }
+        unique_lock file_currdatablock_lock(*datablock_mutex[file.data_index[start_block]]);
 
         size_t chunk_size = min(DATA_BS - block_offset, size - bytes_written);
 
@@ -534,6 +628,7 @@ static int nfs_write(const char *path, const char *buffer, size_t size, off_t of
 
 static int nfs_truncate(const char *path, off_t size)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     Inode file = getInodeByPath(path);
     if (file.id == (size_t)(-1))
         return -ENOENT; 
@@ -541,11 +636,18 @@ static int nfs_truncate(const char *path, off_t size)
     if (file.type == 1)  
         return -EISDIR;  
 
+    if (size < 0 || static_cast<uintmax_t>(size) > static_cast<uintmax_t>(INODE_DATABLOCK_COUNT) * DATA_BS)
+        return -ENOSPC;
+
+    unique_lock file_inode_lock(*inode_mutex[file.id]), datablock_bitmap_lock(datablock_bitmap_mutex);
+
     if (size == 0) 
     {
         bool *free_datablock = (bool *)calloc(superblock.datablocks_count, sizeof(bool));
         diskRead(free_datablock, sizeof(bool), superblock.datablocks_count, sizeof(Superblock)+superblock.inode_count*sizeof(bool));
-        for (size_t i = 0; i < (file.size + DATA_BS - 1) / DATA_BS; i++)
+        size_t blocks_to_free = min(static_cast<size_t>((file.size + DATA_BS - 1) / DATA_BS),
+                        static_cast<size_t>(INODE_DATABLOCK_COUNT));
+        for (size_t i = 0; i < blocks_to_free; i++)
         {
             if (file.data_index[i] != (size_t)-1)
             {
@@ -571,12 +673,14 @@ static int nfs_truncate(const char *path, off_t size)
 
 static int nfs_utimens(const char *path, const struct timespec tv[2]) 
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     Inode file = getInodeByPath(path);
     if (file.id == (size_t)(-1))
         return -ENOENT;
 
     file.atime = tv[0].tv_sec;
     file.mtime = tv[1].tv_sec;
+    unique_lock file_inode_lock(*inode_mutex[file.id]);
  
     diskWrite(&file, sizeof(Inode), 1, sizeof(Superblock) + (superblock.inode_count + superblock.datablocks_count) * sizeof(bool) + file.id * sizeof(Inode));
 
@@ -586,6 +690,7 @@ static int nfs_utimens(const char *path, const struct timespec tv[2])
 
 static int nfs_rmdir(const char *path)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     string parent_path = path; 
     size_t last_slash = parent_path.find_last_of('/');
     if (last_slash == string::npos || last_slash == 0)
@@ -611,6 +716,8 @@ static int nfs_rmdir(const char *path)
     if (dir.data_index[0] != -1)
         return -ENOTEMPTY;
 
+    unique_lock inode_bitmap_lock(inode_bitmap_mutex), dir_inode_lock(*inode_mutex[dir.id]), parent_inode_lock(*inode_mutex[parent.id]);
+
     bool *free_inode = (bool *)calloc(superblock.inode_count, sizeof(bool));
     diskRead(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock));
 
@@ -635,6 +742,7 @@ static int nfs_rmdir(const char *path)
 
 static int nfs_unlink(const char *path)
 {
+    lock_guard<recursive_mutex> operation_lock(operation_mutex);
     string parent_path = path; 
     size_t last_slash = parent_path.find_last_of('/');
     if (last_slash == string::npos || last_slash == 0)
@@ -657,6 +765,11 @@ static int nfs_unlink(const char *path)
 
     if (file.type == 1)
         return -EISDIR;
+
+    unique_lock inode_bitmap_lock(inode_bitmap_mutex),
+                datablock_bitmap_lock(datablock_bitmap_mutex),
+                parentdir_inode_lock(*inode_mutex[parent.id]),
+                file_inode_lock(*inode_mutex[file.id]);
 
     bool *free_inode = (bool *)calloc(superblock.inode_count, sizeof(bool));
     diskRead(free_inode, sizeof(bool), superblock.inode_count, sizeof(Superblock));
@@ -700,6 +813,13 @@ void init()
         cerr << "NFS signature doesn't match\n";
         exit(1);
     } 
+    inode_mutex.resize(superblock.inode_count);
+    for (auto& m : inode_mutex)
+        m = make_unique<mutex>();
+
+    datablock_mutex.resize(superblock.datablocks_count);
+    for (auto& m : datablock_mutex)
+        m = make_unique<mutex>();
 }
 
 int main(int argc, char *argv[])
@@ -708,6 +828,7 @@ int main(int argc, char *argv[])
     
     static struct fuse_operations operations = {};
     operations.getattr = nfs_getattr;
+    operations.statfs = nfs_statfs;
     operations.readdir = nfs_readdir;
     operations.read = nfs_read; 
     operations.rename = nfs_rename;
@@ -715,9 +836,17 @@ int main(int argc, char *argv[])
     operations.mknod = nfs_mknod;
     operations.write = nfs_write;
     operations.open = nfs_open;
+    operations.create = nfs_create;
     operations.truncate = nfs_truncate;
     operations.rmdir = nfs_rmdir;
     operations.unlink = nfs_unlink;
     operations.utimens = nfs_utimens;
-    return fuse_main( argc, argv, &operations, NULL );
+    int res;
+    try {
+        res = fuse_main( argc, argv, &operations, NULL );
+    }
+    catch (const exception &e) {
+        cerr << "Error: " << e.what() << endl;
+    }
+    return res;
 }

@@ -2,8 +2,16 @@
 
 #include <fuse.h>
 #include <filesystem>
-#include <bits/stdc++.h>
+#include <iostream>
+#include <fstream>
+#include <cstring>
+#include <cstdlib>
 #include <time.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <algorithm>
+#include <string>
 using namespace std;
 
 #define ll long long int
@@ -84,7 +92,7 @@ void init()
         exit(1);
     }
     superblock.inode_count = totalsize/MEM_PER_INODE;
-    superblock.datablocks_count = (totalsize - sizeof(Superblock) - superblock.inode_count*sizeof(Inode)) / (DATA_BS + sizeof(bool));
+    superblock.datablocks_count = (totalsize - sizeof(Superblock) - superblock.inode_count * (sizeof(Inode) + sizeof(bool))) / (DATA_BS + sizeof(bool));
     FILE *disk = fopen(diskfile, "r+b");
     fwrite(&superblock, sizeof(Superblock), 1, disk);
     
@@ -134,11 +142,12 @@ void init()
     cout << "Successfull\n" << "Inode count: " << superblock.inode_count << endl;
     cout << "Datablock count: " << superblock.datablocks_count << endl;
     cout << "Total size: " << totalsize << endl;
+    cout << "Inode datablock count: " << INODE_DATABLOCK_COUNT << endl;
 }
 
 int main(int argc, char **argv)
 {
-    cout << "Confirm formatting image.iso (y/N): ";
+    cout << "Confirm formatting " << diskfile << " (y/N): ";
     char x;
     cin >> x;
     if (x=='y' || x=='Y')
